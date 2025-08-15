@@ -1,5 +1,5 @@
 Aug 7, 2025
 [X] setup api calls
 [X] test patient data retrival
-[ ] create github repo
+[X] create github repo
 [ ] create placehoders for patient required data fields
