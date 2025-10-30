@@ -13,6 +13,6 @@ def get_patient_data(patient_id):
     return r.json()
 
 if __name__ == "__main__":
-    patient_id = '20189'  # Replace with a real record ID from REDCap
+    patient_id = '20189'
     response = get_patient_data(patient_id)
     print(response)
