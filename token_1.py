@@ -11,3 +11,8 @@ def get_patient_data(patient_id):
     }
     r = requests.post('https://redcap.idissc.org/redcap/api/', data=user_data)
     return r.json()
+
+if __name__ == "__main__":
+    patient_id = '20189'  # Replace with a real record ID from REDCap
+    response = get_patient_data(patient_id)
+    print(response)
