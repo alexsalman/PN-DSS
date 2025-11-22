@@ -13,3 +13,4 @@ urllib3==2.5.0
 faiss-cpu==1.12.0
 sentence-transformers==5.1.2
 reportlab==4.4.4
+PyPDF2==3.0.1
