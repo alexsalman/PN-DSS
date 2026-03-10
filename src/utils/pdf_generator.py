@@ -13,135 +13,162 @@ from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 
 def sanitize_for_pdf(text):
-    """Ensures text is safe for ReportLab's XML parser and handles Markdown."""
-    if not text: return ""
-    if isinstance(text, (dict, list)):
-        text = json.dumps(text, indent=2)
-
-    text = str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    """Global cleaner for PDF text. Strips artifacts and handles formatting."""
+    if text is None: return ""
     
-    # Re-enable specific safe tags
+    # 1. Convert to string and strip LLM internal monologues
+    text = str(text)
+    text = re.sub(r'<(think|thought)>.*?</\1>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'(?i)Thinking\.\.\..*?(\.\.\.done thinking|Let\'s think).*?\.?', '', text, flags=re.DOTALL)
+    
+    # 2. Aggressive artifact removal (Non-ASCII "Nuclear Option")
+    text = re.sub(r'[^\x00-\x7f]', ' ', text)
+    text = text.replace('<br>', '\n').replace('<br/>', '\n')
+    
+    # 3. Handle XML Escaping while preserving intended bold/italic tags
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     text = text.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-    text = text.replace('&lt;br/&gt;', '<br/>').replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
-
-    # Convert Markdown to PDF-safe HTML
+    text = text.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
+    
+    # Convert Markdown ** to PDF <b>
     text = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'\*(.*?)\*', r'<i>\1</i>', text)
     
-    for tag in ['b', 'i']:
-        open_count = text.count(f'<{tag}>')
-        close_count = text.count(f'</{tag}>')
-        if open_count > close_count:
-            text += f'</{tag}>' * (open_count - close_count)
-
-    return text.replace('\n', '<br/>')
-
-def parse_meal_table(output_text, styles):
-    """Resilient parsing for Markdown tables from the Planner Agent."""
-    output_text = str(output_text).strip()
+    # Clean up double spaces
+    text = re.sub(r' +', ' ', text)
     
-    if "|" in output_text:
-        rows = []
-        lines = output_text.split('\n')
-        for line in lines:
-            if re.match(r'^[\s|:-]+$', line): continue
-            if '|' in line:
-                raw_cells = [c.strip() for c in line.split('|')]
-                if raw_cells and raw_cells[0] == "": raw_cells.pop(0)
-                if raw_cells and raw_cells[-1] == "": raw_cells.pop()
-                if raw_cells:
-                    processed_cells = [Paragraph(sanitize_for_pdf(c), styles['Small']) for c in raw_cells]
-                    rows.append(processed_cells)
-        
-        if len(rows) > 1:
-            num_cols = len(rows[0])
-            col_widths = [530 / num_cols] * num_cols # Default even distribution
-            if num_cols == 6: col_widths = [45, 105, 105, 105, 105, 65]
+    return text.strip().replace('\n', '<br/>')
 
-            try:
-                t = Table(rows, colWidths=col_widths, repeatRows=1)
-                t.setStyle(TableStyle([
-                    ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                    ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-                    ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#2E5077")),
-                    ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
-                    ('FONTSIZE', (0,0), (-1,-1), 8),
-                    ('ALIGN', (0,0), (-1,-1), 'LEFT'),
-                ]))
-                return [t]
-            except: pass
+def parse_markdown_table_to_list(text, remove_repeated_headers=True):
+    """Resilient MD table parser."""
+    rows = []
+    text_str = str(text)
+    start_idx = text_str.find('|')
+    if start_idx == -1: return []
+    
+    lines = text_str[start_idx:].strip().split('\n')
+    header_keywords = ["Day", "Breakfast", "Lunch", "Dinner", "Metric", "Target"]
+    
+    for line in lines:
+        if re.match(r'^[\s|:-]+$', line): continue 
+        if '|' in line:
+            cells = [c.strip() for c in line.split('|')]
+            if cells and cells[0] == "": cells.pop(0)
+            if cells and cells[-1] == "": cells.pop()
             
-    return [Paragraph(sanitize_for_pdf(output_text), styles['BodyText'])]
+            if remove_repeated_headers and len(rows) > 0:
+                if any(k in cells for k in header_keywords) and len(cells) < 3:
+                    continue
+            
+            if cells: rows.append(cells)
+    return rows
+
+def build_reportlab_table(data, col_widths, styles, is_header_blue=True):
+    """Constructs tables with internal padding and sanitized cell content."""
+    processed_rows = [[Paragraph(sanitize_for_pdf(cell), styles['Small']) for cell in row] for row in data]
+    t = Table(processed_rows, colWidths=col_widths, repeatRows=1)
+    
+    bg = colors.HexColor("#2E5077") if is_header_blue else colors.HexColor("#D1D1D1")
+    txt = colors.whitesmoke if is_header_blue else colors.black
+    
+    t.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
+        ('BACKGROUND', (0,0), (-1,0), bg),
+        ('TEXTCOLOR', (0,0), (-1,0), txt),
+        ('FONTSIZE', (0,0), (-1,-1), 8),
+        ('LEFTPADDING', (0,0), (-1,-1), 8),
+        ('RIGHTPADDING', (0,0), (-1,-1), 8),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+    ]))
+    return t
 
 def save_to_pdf(filename, report_payload):
-    """
-    Saves the final Clinical Report using the ReportAgent's payload.
-    """
+    """Generates the PN-DSS Clinical Report with cleaned formatting and latency tracking."""
     os.makedirs(os.path.dirname(filename), exist_ok=True)
     doc = SimpleDocTemplate(filename, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
     styles = getSampleStyleSheet()
-    
-    # Custom Styles
     styles.add(ParagraphStyle(name='Small', fontSize=8, leading=10))
     styles.add(ParagraphStyle(name='CenterHeading', parent=styles['Heading1'], alignment=TA_CENTER))
-    styles.add(ParagraphStyle(name='VerdictStyle', parent=styles['BodyText'], backColor=colors.whitesmoke, borderPadding=5, borderRadius=3, borderIndex=1))
     
     flowables = []
-    metadata = report_payload.get('metadata', {})
+    meta = report_payload.get('metadata', {})
+    total_time = meta.get('total_generation_time', 'N/A')
+
+    # 1. HEADER
+    flowables.append(Paragraph(sanitize_for_pdf(meta.get('report_title', "PN-DSS Report")), styles['CenterHeading']))
+    flowables.append(Paragraph(
+        f"<b>Patient ID:</b> {meta.get('patient_id')} | "
+        f"<b>Generated:</b> {meta.get('report_date')} | "
+        f"<b>Latency:</b> {total_time}s", 
+        styles['Small']
+    ))
+    flowables.append(Spacer(1, 20))
+
+    # 2. MEAL PLAN
+    flowables.append(Paragraph("Proposed Dietary Plan", styles['Heading2']))
+    meal_data = parse_markdown_table_to_list(report_payload.get('meal_plan_table', ''))
+    if meal_data:
+        # Check if header needs injection
+        if not any("Day" in str(cell) for cell in meal_data[0]):
+            meal_data.insert(0, ["Day", "Breakfast", "Lunch", "Dinner"])
+        flowables.append(build_reportlab_table(meal_data, [40, 160, 160, 160], styles, True))
     
-    # 1. Header & Metrics Dashboard
-    flowables.append(Paragraph("Clinical Nutrition Analysis Report", styles['CenterHeading']))
-    flowables.append(Paragraph(f"<b>Patient:</b> {metadata.get('patient_id')} | <b>Date:</b> {metadata.get('report_date')}", styles['Small']))
+    flowables.append(Spacer(1, 20))
+
+    # 3. EVALUATION & AUDIT
+    flowables.append(Paragraph("Clinical Evaluation & Audit", styles['Heading1']))
     flowables.append(Spacer(1, 10))
-    
-    # Dashboard Table
-    dash_data = [
-        ["BMI", "Kcal Goal", "Protein Goal", "Status"],
-        [metadata.get('bmi'), f"{metadata.get('kcal_target')} kcal", f"{metadata.get('protein_target')} g", metadata.get('status')]
-    ]
-    dash_table = Table(dash_data, colWidths=[100, 100, 100, 130])
-    dash_table.setStyle(TableStyle([
-        ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-        ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#F0F0F0")),
-        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-        ('FONTSIZE', (0,0), (-1,-1), 10),
-    ]))
-    flowables.append(dash_table)
-    flowables.append(Spacer(1, 20))
 
-    # 2. Executive Summary
-    flowables.append(Paragraph("Executive Summary", styles['Heading2']))
-    flowables.append(Paragraph(sanitize_for_pdf(report_payload.get('clinical_summary')), styles['BodyText']))
-    flowables.append(Spacer(1, 15))
+    # Layer 1: Technical Audit
+    flowables.append(Paragraph("Layer 1: Technical Audit", styles['Heading2']))
+    l1 = report_payload.get('layer_1_audit', {})
     
-    # 3. Safety Audit & Judge Critique
-    flowables.append(Paragraph("Independent Safety Audit", styles['Heading2']))
-    verdict_color = colors.green if metadata.get('status') == 'Safe' else colors.orange
-    if metadata.get('status') == 'Unsafe': verdict_color = colors.red
-    
-    flowables.append(Paragraph(f"<b>Verdict:</b> <font color='{verdict_color}'>{metadata.get('status')}</font>", styles['BodyText']))
-    flowables.append(Paragraph(sanitize_for_pdf(report_payload.get('judge_critique')), styles['VerdictStyle']))
-    flowables.append(Spacer(1, 20))
-
-    # 4. Meal Plan Table
-    flowables.append(Paragraph("Proposed 7-Day Dietary Plan", styles['Heading2']))
-    flowables.extend(parse_meal_table(report_payload.get('meal_plan_table'), styles))
-    flowables.append(PageBreak())
-
-    # 5. Agent Trace (Transparency)
-    flowables.append(Paragraph("Reasoning Trace & Decision Log", styles['Heading2']))
-    trace = report_payload.get('clinical_trace', [])
+    trace = l1.get('agent_trace', [])
     if trace:
-        trace_data = [["Agent", "Role", "Summary"]]
-        for entry in trace:
-            trace_data.append([entry[0], entry[1], Paragraph(sanitize_for_pdf(entry[2]), styles['Small'])])
-        
-        t_table = Table(trace_data, colWidths=[100, 80, 350])
-        t_table.setStyle(TableStyle([
-            ('GRID', (0,0), (-1,-1), 0.5, colors.grey),
-            ('VALIGN', (0,0), (-1,-1), 'TOP'),
-            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#EEEEEE")),
-        ]))
-        flowables.append(t_table)
+        trace_data = [["Specialist Agent", "Clinical Rationale", "Time"]]
+        for e in trace:
+            # Handle float or N/A duration
+            dur_val = e.get('duration', 'N/A')
+            dur_str = f"{dur_val}s" if isinstance(dur_val, (int, float)) else f"{dur_val}s"
+            
+            trace_data.append([
+                str(e.get('agent', 'Unknown')), 
+                str(e.get('logic', 'N/A')), 
+                dur_str
+            ])
+            
+        flowables.append(build_reportlab_table(trace_data, [90, 380, 60], styles, False))
+    
+    flowables.append(Spacer(1, 15))
+
+    # Verdict Visualization
+    status = str(l1.get('verdict', 'CAUTION')).upper()
+    v_color = colors.darkgreen if status == 'SAFE' else colors.red if status == 'UNSAFE' else colors.darkorange
+    flowables.append(Paragraph(f"<b>Overall Audit Verdict:</b> <font color='{v_color}'>{status}</font>", styles['BodyText']))
+    
+    audit_data = parse_markdown_table_to_list(l1.get('structured_comparison', ''))
+    if audit_data:
+        flowables.append(Spacer(1, 5))
+        flowables.append(build_reportlab_table(audit_data, [70, 70, 70, 50, 270], styles, False))
+
+    flowables.append(Spacer(1, 20))
+
+    # Layer 2: DQI-I Analysis
+    flowables.append(Paragraph("Layer 2: Quantitative Analysis (DQI-I)", styles['Heading2']))
+    l2 = report_payload.get('layer_2_quantitative', {})
+    
+    raw_score_str = str(l2.get('total_score', '0')).split('/')[0]
+    total_score = re.sub(r'[^0-9.]', '', raw_score_str)
+    
+    dqi_table = [
+        ["Category", "Score", "Max Points"],
+        ["Variety", str(l2.get('variety_score', 0)), "20"],
+        ["Adequacy", str(l2.get('adequacy_score', 0)), "40"],
+        ["Moderation", str(l2.get('moderation_score', 0)), "30"],
+        ["Balance", str(l2.get('balance_score', 0)), "10"],
+        ["Total Index", f"<b>{total_score}</b>", "100"]
+    ]
+    flowables.append(build_reportlab_table(dqi_table, [180, 175, 175], styles, False))
 
     doc.build(flowables)

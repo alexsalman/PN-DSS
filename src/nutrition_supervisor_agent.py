@@ -3,7 +3,7 @@
 import json
 import os
 import datetime
-import asyncio
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List
@@ -19,6 +19,7 @@ from src.agents.report_agent import ReportAgent
 from src.agents.lm_judge_agent import LMJudgeAgent
 
 # --- Utility Imports ---
+from src.utils.dqi_calculator import DQICalculator
 try:
     import src.utils.redcap_connector as redcap_connector
 except ImportError:
@@ -36,193 +37,168 @@ class NutritionSupervisorAgent:
     report_agent: Optional[ReportAgent] = None
     lm_judge_agent: Optional[LMJudgeAgent] = None
     
-    memory_path: str = "data/patient_memory.json"
-    memory_registry: Dict[str, Any] = field(default_factory=dict)
-    current_patient_id: Optional[str] = None 
+    memory_dir: str = "memory"
+    dqi_calculator: DQICalculator = field(default_factory=DQICalculator)
 
     def __post_init__(self):
-        self._load_memory_from_disk()
+        if not os.path.exists(self.memory_dir):
+            os.makedirs(self.memory_dir)
 
-    async def supervise(self, patient_id: Any, query: str = None) -> Dict[str, Any]:
-        patient_id_str = str(patient_id)
-        self.current_patient_id = patient_id_str 
+    async def supervise(self, query: str = "") -> Dict[str, Any]:
+        pipeline_start = time.time()
         
-        # 1. State Reconciliation
-        existing_state = self.memory_registry.get(patient_id_str, {
-            "metadata": {"id": patient_id_str, "first_visit": datetime.datetime.now().strftime("%Y-%m-%d")},
-            "visit_history": []
-        })
+        # 1. PARSE QUERY
+        id_match = re.search(r'(?:ID\s*)?(\d{4,})', query, re.IGNORECASE)
+        days_match = re.search(r'(\d+)\s*day', query.lower())
+        pid = id_match.group(1) if id_match else None
+        plan_duration = days_match.group(1) if days_match else "7"
 
-        # 2. Data Acquisition
-        try:
-            patient = self._fetch_patient_data(patient_id_str)
-        except Exception as e:
-            return {"status": "ERROR", "message": f"Data Acquisition Failed: {e}"}
+        if not pid:
+            return {"status": "ERROR", "message": "No valid Patient ID found."}
 
+        # 2. BLACKBOARD RETRIEVAL
+        patient = self._get_patient_state(pid)
+
+        # 3. CONTEXT INITIALIZATION
         categories = self._categorize(patient)
         missing_checklist = {k: (v is None or v == "") for k, v in patient.items()}
         
-        # 3. Context Construction
         context = {
             "metadata": {
-                "patient_id": patient_id_str, 
-                "timestamp": datetime.datetime.now().isoformat(),
-                "visit_count": len(existing_state.get("visit_history", [])) + 1
+                "patient_id": pid, 
+                "plan_duration": plan_duration,
+                "report_date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "visit_count": patient.get("metadata", {}).get("visit_count", 0) + 1
             },
-            "history": existing_state, 
             "user_query": query,
-            "agent_trace": [], 
             "agent_outcomes": [], 
-            "status": "PROCESSING",
-            "timers": {} 
+            "timers": {}
         }
 
-        # --- STAGE 3: Reasoning (Stateful) ---
+        # 4. REASONING PHASE
         evaluator_steps = [
-            ("Personal Evaluator", self.personal_evaluator_agent),
-            ("Nutrients Evaluator", self.nutrients_evaluator_agent),
-            ("Microbiome Modulation", self.microbiome_modulation_agent),
-            ("Constraint Manager", self.constraint_manager_agent)
+            ("Personal", self.personal_evaluator_agent, "personal_evaluator_memory"),
+            ("Nutrients", self.nutrients_evaluator_agent, "nutrients_evaluator_memory"),
+            ("Microbiome", self.microbiome_modulation_agent, "microbiome_modulation_memory"),
+            ("Constraints", self.constraint_manager_agent, "constraint_manager_memory")
         ]
-        
-        print(f"\n[REASONING PHASE] Executing clinical evaluations...")
-        for name, agent in tqdm(evaluator_steps, desc="Clinical Reasoning", unit="agent"):
+
+        print(f"\n[REASONING PHASE] Clinical Evaluation for Patient {pid}")
+        for name, agent, memory_key in tqdm(evaluator_steps, desc="Clinical Reasoning"):
             if not agent: continue
+            step_start = time.time()
+            agent.run(patient, categories, missing_checklist, context)
+            dur = round(time.time() - step_start, 2)
             
-            start_agent = time.time()
-            res = agent.run(patient, categories, missing_checklist, context)
-            context["timers"][name] = round(time.time() - start_agent, 2)
-            
-            key = name.lower().replace(" ", "_")
-            context[key] = res
-            
-            clean_summary = self._clean_summary(str(res.get('summary', 'Analysis complete.')))
-            context["agent_outcomes"].append([name, "Reasoning", clean_summary])
-            # Keep trace for PDF
-            context["agent_trace"].append([name, "Reasoning", res.get('summary')])
+            context["timers"][name] = dur
+            final_memory = self._read_latest_memory(pid)
+            rationale = final_memory.get("agent_memories", {}).get(memory_key, "Complete.")
+            context["agent_outcomes"].append([name, "Reasoning", rationale, dur])
 
-        # --- STAGE 4: Planning (Stateful) ---
-        print(f"\n[PLANNING PHASE] Generating Meal Plan...")
+        # 5. PLANNING PHASE
         start_plan = time.time()
-        planner_res = self.meal_planner_agent.run(patient, categories, missing_checklist, context)
-        context["timers"]["Meal Planner"] = round(time.time() - start_plan, 2)
-        context['meal_planner'] = planner_res
+        self.meal_planner_agent.run(patient, categories, missing_checklist, context)
+        plan_dur = round(time.time() - start_plan, 2)
+        context["timers"]["Planner"] = plan_dur
         
-        context["agent_outcomes"].append([
-            "Meal Planner", 
-            "Planning", 
-            self._clean_summary(planner_res.get('summary', '7-day plan generated.'))
-        ])
-        context["agent_trace"].append(["Meal Planner", "Planning", planner_res.get('summary')])
+        planner_mem = self._read_latest_memory(pid).get("agent_memories", {})
+        planner_data = planner_mem.get("meal_planner_data", {})
+        context["agent_outcomes"].append(["Planner", "Planning", "Plan generated.", plan_dur])
 
-        # --- STAGE 5: Evaluation (Stateless LM Judge) ---
-        print(f"\n[EVALUATION PHASE] Auditing Plan for Completeness...")
+        # 6. EVALUATION PHASE
+        # --- DQI Calculator ---
+        start_dqi = time.time()
+        dqi_results = self.dqi_calculator.get_dqi_report(planner_data.get('meal_plan', ''), planner_data.get('clinical_targets', {}))
+        self._save_to_blackboard(pid, "dqi_evaluation_data", dqi_results)
+        context["timers"]["DQI Calculator"] = round(time.time() - start_dqi, 2)
+        
+        # --- LAYER 1: JUDGE (The Technical Audit) ---
         start_judge = time.time()
-        # FIXED: Only passing context (stateless)
         judge_res = self.lm_judge_agent.run(context)
-        context["timers"]["LM Judge"] = round(time.time() - start_judge, 2)
-        context['lm_judge'] = judge_res
+        judge_dur = round(time.time() - start_judge, 2)
         
-        judge_data = judge_res.get('data', {})
-        verdict = judge_data.get('verdict', 'Review')
-        context["agent_outcomes"].append(["LM Judge", "Evaluation", f"Verdict: {verdict}"])
-        context["agent_trace"].append(["LM Judge", "Evaluation", judge_data.get('critique')])
+        context["judge_result"] = judge_res.get("data", {})
+        context["timers"]["Technical Audit"] = judge_dur
+        # Inject the Judge as a visible outcome for the Audit Table
+        context["agent_outcomes"].append(["Technical Audit", "Safety", "Validation Complete.", judge_dur])
 
-        # --- STAGE 6: Response (Stateless Reporting) ---
-        print("\n[RESPONSE PHASE] Finalizing Clinical Report...")
-        if self.report_agent:
-            context["agent_outcomes"].append(["Report Agent", "Reporting", "Compiling clinical trace into PDF."])
+        # 7. RESPONSE PHASE & PDF GENERATION
+        self._update_metadata(pid, patient, context)
+        report_out = self.report_agent.run(patient, context)
+        report_payload = report_out.get('data', {})
+
+        # --- BRIDGE LOGIC: FIXING "N/A" AND MISSING JUDGE TIME ---
+        if 'layer_1_audit' in report_payload:
+            # Create map from our context timers
+            duration_map = {outcome[0]: outcome[3] for outcome in context["agent_outcomes"] if len(outcome) > 3}
+            trace = report_payload['layer_1_audit'].get('agent_trace', [])
+            updated_trace = []
+            seen_agents = set()
+
+            for entry in trace:
+                name = entry.get('agent')
+                if name in duration_map:
+                    entry['duration'] = duration_map[name] # Replace N/A
+                    seen_agents.add(name)
+                updated_trace.append(entry)
             
-            start_report = time.time()
-            # FIXED: Only passing patient and context (stateless)
-            report_out = self.report_agent.run(patient, context)
-            context["timers"]["Report Agent"] = round(time.time() - start_report, 2)
-            
-            context['report_agent'] = report_out
-            context["status"] = "COMPLETED"
-            context["judge_result"] = judge_data 
-            
-            # Update trace with final logic
-            context["agent_trace"].append(["Report Agent", "Response", report_out.get('summary')])
-            
-            # Generate the file using your ReportAgent payload
-            filename = self._generate_final_pdf(patient_id_str, context)
-            context["report_path"] = filename
-            
-            self._update_patient_state(patient_id_str, context)
+            # Ensure Technical Audit is in the list
+            if "Technical Audit" not in seen_agents:
+                updated_trace.append({
+                    "agent": "Technical Audit",
+                    "logic": "LM-Judge Safety and Technical Verification Complete.",
+                    "duration": judge_dur
+                })
+            report_payload['layer_1_audit']['agent_trace'] = updated_trace
 
-        return context
+        # Update global latency in header
+        total_time = round(time.time() - pipeline_start, 2)
+        report_payload.setdefault('metadata', {})['total_generation_time'] = total_time
 
-    def _clean_summary(self, text: str) -> str:
-        if not text: return "Analysis complete."
-        sentence = text.split('.')[0] + "."
-        return (sentence[:97] + "...") if len(sentence) > 100 else sentence
-
-    def _fetch_patient_data(self, pid: str) -> Dict:
-        if redcap_connector:
-            try:
-                raw = redcap_connector.get_patient_data(pid)
-                if raw and isinstance(raw, list) and len(raw) > 0:
-                    data = raw[0]
-                    data['record_id'] = pid
-                    return data
-            except: pass
-
-        local_path = f"data/{pid}.json"
-        if os.path.exists(local_path):
-            with open(local_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        
-        raise Exception(f"Patient {pid} not found. Ensure data/{pid}.json exists.")
-
-    def _update_patient_state(self, pid: str, ctx: Dict):
-        current_visit = {
-            "timestamp": datetime.datetime.now().isoformat(),
-            "query": ctx.get('user_query'),
-            "verdict": ctx.get('judge_result', {}).get('verdict'),
-            "execution_times": ctx.get('timers'),
-            "report_file": ctx.get('report_path')
-        }
-
-        if pid not in self.memory_registry:
-            self.memory_registry[pid] = {
-                "metadata": {"id": pid, "first_visit": datetime.datetime.now().strftime("%Y-%m-%d")},
-                "visit_history": []
-            }
-        
-        self.memory_registry[pid]["visit_history"].append(current_visit)
-
-        os.makedirs(os.path.dirname(self.memory_path), exist_ok=True)
-        with open(self.memory_path, 'w', encoding='utf-8') as f:
-            json.dump(self.memory_registry, f, indent=4)
-
-    def _categorize(self, patient: Dict) -> Dict:
-        try:
-            from src.utils.field_mapping import PATIENT_FIELD_CATEGORIES
-            cat = {c: {} for c in PATIENT_FIELD_CATEGORIES}
-            cat["uncategorized"] = {}
-            mapping = {f: c for c, fields in PATIENT_FIELD_CATEGORIES.items() for f in fields}
-            for k, v in patient.items():
-                cat[mapping.get(k, "uncategorized")][k] = v
-            return cat
-        except:
-            return {"personal": patient, "uncategorized": patient}
-
-    def _generate_final_pdf(self, pid: str, ctx: Dict) -> str:
-        # Use the payload constructed by the stateless ReportAgent
-        report_payload = ctx.get('report_agent', {}).get('data', {})
-        
         os.makedirs("reports", exist_ok=True)
         filename = f"reports/report_{pid}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
-        
-        # This now matches your save_to_pdf(filename, report_payload) version
         save_to_pdf(filename, report_payload)
-        return filename
+        
+        return {"status": "COMPLETED", "report_path": filename, "total_runtime": total_time}
 
-    def _load_memory_from_disk(self):
-        if os.path.exists(self.memory_path):
-            try:
-                with open(self.memory_path, 'r', encoding='utf-8') as f:
-                    self.memory_registry = json.load(f)
-            except: 
-                self.memory_registry = {}
+    def _save_to_blackboard(self, pid: str, key: str, data: Dict):
+        path = f"{self.memory_dir}/{pid}.json"
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                mem = json.load(f)
+            mem.setdefault("agent_memories", {})[key] = data
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(mem, f, indent=4)
+
+    def _read_latest_memory(self, pid: str) -> Dict:
+        path = f"{self.memory_dir}/{pid}.json"
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {}
+
+    def _get_patient_state(self, pid: str) -> Dict:
+        path = f"{self.memory_dir}/{pid}.json"
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        if redcap_connector:
+            raw = redcap_connector.get_patient_data(pid)
+            if raw and len(raw) > 0:
+                data = raw[0]
+                data['record_id'] = pid
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
+                return data
+        raise Exception(f"Patient {pid} not found in memory.")
+
+    def _update_metadata(self, pid: str, patient_data: Dict, ctx: Dict):
+        path = f"{self.memory_dir}/{pid}.json"
+        current_state = self._read_latest_memory(pid)
+        current_state.setdefault("metadata", {})["last_visit"] = datetime.datetime.now().isoformat()
+        current_state["metadata"]["visit_count"] = ctx["metadata"]["visit_count"]
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(current_state, f, indent=4)
+
+    def _categorize(self, patient: Dict) -> Dict:
+        return {"personal": patient, "clinical": patient}

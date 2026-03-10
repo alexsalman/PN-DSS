@@ -3,8 +3,9 @@
 import asyncio
 import os
 import sys
-import time  # Added for UX Performance Tracking
+import time
 import argparse
+from pathlib import Path
 from dotenv import load_dotenv
 
 # --- Agent Imports ---
@@ -20,13 +21,18 @@ from src.agents.lm_judge_agent import LMJudgeAgent
 load_dotenv()
 
 async def main():
-    # 1. Parse Arguments
+    # 1. Blackboard Initialisation
+    memory_dir = Path("memory")
+    if not memory_dir.exists():
+        memory_dir.mkdir(parents=True)
+        print("[SYSTEM] Created 'memory' directory for patient state files.")
+
+    # 2. Parse Arguments
     parser = argparse.ArgumentParser(description="PN-DSS Clinical Pipeline")
-    parser.add_argument("--id", type=str, default=None, help="Patient ID") 
-    parser.add_argument("--query", type=str, default="Generate a 7-day plan optimized for fiber intake.", help="Clinical Query")
+    parser.add_argument("--query", type=str, help="Full command (e.g., 'ID 20189 7-day high fiber plan')")
     args = parser.parse_args()
 
-    # 2. Initialize the System (Supervisor is the entry point)
+    # 3. Agent Initialization
     try:
         pndss_system = NutritionSupervisorAgent(
             personal_evaluator_agent=PersonalEvaluatorAgent(),
@@ -41,72 +47,73 @@ async def main():
         print(f"Critical Error: Failed to initialize agents: {e}")
         return
     
-    # 3. Stateful ID Check 
-    target_id = args.id
-    if not target_id:
-        if hasattr(pndss_system, 'current_patient_id') and pndss_system.current_patient_id:
-            target_id = pndss_system.current_patient_id
-            print(f"[SYSTEM] No ID provided. Defaulting to active session: {target_id}")
-        else:
-            target_id = input("[SYSTEM] No Patient ID found. Please enter Patient ID: ").strip()
-            if not target_id:
-                print("Error: Patient ID is required.")
-                return
+    # 4. Input Parsing & Dynamic Input Handling
+    raw_command = args.query or input("[SYSTEM] Enter Full Clinical Query: ").strip()
+    if not raw_command:
+        print("Error: A query is required to proceed.")
+        return
 
     print("\n" + "="*50)
     print("PN-DSS CLINICAL PIPELINE START")
-    print(f"Patient ID: {target_id}")
-    print(f"Query: {args.query}")
+    print(f"Input Command: {raw_command}")
     print("="*50 + "\n")
 
-    # 4. Execution & UX Performance Tracking
+    # 5. Pipeline Launch & Execution with High-Level Timer
     start_time = time.time() 
     try:
-        # Pass both ID and Terminal Query to the Supervisor
-        result = await pndss_system.supervise(patient_id=target_id, query=args.query)
+        # The result payload should now include 'total_runtime' for the PDF
+        result = await pndss_system.supervise(query=raw_command)
     except Exception as e:
         print(f"Pipeline Failure: {e}")
         return
     finally:
+        # Calculate wall-clock time for the entire async operation
         total_runtime = round(time.time() - start_time, 2)
 
-    # 5. Handle Results
-    # Normalize status check to handle various agent return cases
+    # 6. Multi-Layer Outcome Verification
     status = str(result.get('status', 'ERROR')).upper()
     
     print("\n" + "="*50)
-    print(f"FINAL PIPELINE OUTPUT (Total Time: {total_runtime}s)")
+    print(f"FINAL PIPELINE OUTPUT")
+    print(f"Total Execution Time: {total_runtime}s")
     print("="*50)
 
-    if status in ["SUCCESS", "COMPLETED", "APPROVED", "WARNING"]:
-        # A. Judge Feedback (Stage 5 - Stateless Assessment)
+    if status == "COMPLETED":
+        # Layer 1 Audit: Verdict
         judge_data = result.get('judge_result', {})
-        verdict = judge_data.get('verdict', 'N/A')
-        critique = judge_data.get('critique', 'No critique available.')
-
-        print(f"\n>>> PIPELINE STATUS: {status} (Verdict: {verdict})")
-        # Displaying first 300 chars of critique for readability
-        print(f"    Judge Critique: {critique[:300]}...")
-
-        # B. PDF Path Check (Supervisor handles file persistence)
-        report_path = result.get('report_path') or f"reports/report_{target_id}.pdf"
-        if os.path.exists(report_path):
-            print(f"\n[SUCCESS] Clinical Report generated: {report_path}")
+        print(f"\n>>> PIPELINE STATUS: {status} (Verdict: {judge_data.get('verdict', 'N/A')})")
+        
+        # File Persistence Check
+        report_path = result.get('report_path')
+        if report_path and os.path.exists(report_path):
+            print(f"[SUCCESS] Clinical Report generated: {report_path}")
         else:
             print(f"\n[PARTIAL] Pipeline finished, but PDF file not found at {report_path}")
             
     else:
         print(f"\n[FAILED] System Error: {result.get('message', 'Unknown error')}")
 
-    # 6. Decision Trace (Stage 6 - Response Synthesis)
+    # 7. Layer 3 Trace (Clinical Decision Log + Latency Audit)
     print("\n" + "-"*20 + " CLINICAL TRACE " + "-"*20)
     outcomes = result.get('agent_outcomes', [])
-    for agent_name, role, rationale in outcomes:
-        print(f"-> [{agent_name}] ({role})")
-        # Clean rationale for console display
-        clean_rationale = str(rationale).replace('\n', ' ')[:150]
-        print(f"   Rationale: {clean_rationale}...\n")
-    print("-" * 56)
+    
+    # Unpack agent results, checking for the fourth timing element
+    for agent_data in outcomes:
+        # Handle varying tuple lengths gracefully
+        agent_name = agent_data[0]
+        role = agent_data[1]
+        rationale = agent_data[2]
+        duration = agent_data[3] if len(agent_data) > 3 else "N/A"
+        
+        # Check for thinking leaks (Coherence Audit)
+        leak_flag = "[!] LEAK" if "Thinking..." in str(rationale) else "[OK]"
+        
+        # Display Agent Name, Status, and individual Latency
+        print(f"-> [{agent_name}] ({role}) {leak_flag} | Latency: {duration}s")
+        # Truncate rationale for cleaner terminal view
+        print(f"   Rationale: {str(rationale)[:150]}...\n")
+        
+    print("-" * 25 + f" End of Trace ({total_runtime}s) " + "-" * 25)
 
 if __name__ == "__main__":
     try:

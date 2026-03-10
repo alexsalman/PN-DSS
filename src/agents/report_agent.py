@@ -1,104 +1,138 @@
 # src/agents/report_agent.py
 
 import datetime
-import subprocess
 import re
+import json
+import os
 from typing import Dict, Any
 
 class ReportAgent:
     """
     Response Stage (Stage 6):
     Final Clinical Documenter.
-    Stateless: Synthesizes the finalized, audited data into a structured 
-    clinical report payload for the PDF Generator without storing history.
+    
+    Acts as a data orchestrator. It harvests results and sanitizes reasoning logs 
+    to ensure the final report follows the 3-Layer Clinical Audit structure.
     """
     def __init__(self, model_name: str = "gpt-oss:20b"):
         self.name = "Report Agent"
         self.role = "Response"
         self.model_name = model_name
+        self.memory_dir = "memory"
+
+    def _sanitize_logic(self, text: str) -> str:
+        """
+        Aggressively strips internal 'Thinking' blocks, LLM monologues, 
+        and self-instruction leaks to ensure only professional rationale remains.
+        """
+        if not text or text == "N/A": 
+            return "Assessment complete."
+            
+        text = str(text)
+
+        # 1. Kill standard tags: <think>...</think>
+        text = re.sub(r'<(think|thought)>.*?</\1>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # 2. Kill conversational filler and instruction leaks
+        text = re.sub(r'(?i)Thinking\.\.\..*?(\.\.\.done thinking|Let\'s think).*?\.?', '', text, flags=re.DOTALL)
+        
+        instruction_patterns = [
+            r'(?i)We need (to|a) (produce|give|provide|one sentence).*?\.',
+            r'(?i)Provide a concise rationale:?',
+            r'(?i)Just one sentence\.?',
+            r'(?i)Should refer to weight target\.?',
+        ]
+        for pattern in instruction_patterns:
+            text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+
+        # 3. Truncate for table neatness
+        if len(text) > 250:
+            return text[:247].strip() + "..."
+            
+        return text.strip() or "Clinical rationale validated."
 
     def run(self, patient: Dict, context: Dict = None) -> Dict:
         """
-        Processes the consolidated context from the Supervisor into a 
-        final report payload.
+        Synthesizes all agent memories into the structured payload.
+        Structure: Metadata -> Meal Plan -> Layer 1 (Trace + Audit) -> Layer 2 (DQI)
         """
         pid = str(patient.get('record_id', 'unknown'))
-        print(f"\n[DEBUG_AGENT_IN: {self.name}] Synthesizing Final Clinical Report for PID: {pid}...")
-
+        memory_path = f"{self.memory_dir}/{pid}.json"
+        
+        # Create a lookup for durations from the Supervisor context
+        # This ensures we have the actual numbers calculated in the pipeline
+        timers = context.get("timers", {}) if context else {}
+        
         try:
-            # 1. RECEIVE AUDITED PACKAGE
-            planner_results = context.get('meal_planner', {}).get('data', {})
-            judge_results = context.get('lm_judge', {}).get('data', {})
+            memories = {}
+            if os.path.exists(memory_path):
+                with open(memory_path, 'r', encoding='utf-8') as f:
+                    full_memory = json.load(f)
+                    memories = full_memory.get("agent_memories", {})
+
+            judge_data = memories.get('lm_judge_data', {})
+            plan_data = memories.get('meal_planner_data', {})
+            dqi_data = memories.get('dqi_evaluation_data', {}) 
+            dqi_breakdown = dqi_data.get('breakdown', {})
             
-            # Extract reasoning summaries (Rationale)
-            summaries = planner_results.get('agent_summaries', {})
-            meal_plan = planner_results.get('meal_plan', 'Meal plan not generated.')
-            
-            # Independent safety verdict
-            verdict = judge_results.get('verdict', 'N/A')
-            critique = judge_results.get('critique', 'Audit feedback pending.')
-
-            # 2. CLINICAL NARRATIVE SYNTHESIS
-            prompt = (
-                f"System: Senior Clinical Nutritionist Writing Lead.\n"
-                f"Patient Profile: {pid}\n\n"
-                f"[REASONING LOGIC]\n"
-                f"- Personal/Metabolic: {summaries.get('personal', 'Stable weight maintenance.')}\n"
-                f"- Nutrients: {summaries.get('nutrients', 'Standard macro distribution.')}\n"
-                f"- Microbiome: {summaries.get('microbiome', 'General enrichment strategy.')}\n"
-                f"- Clinical Rules: {summaries.get('constraints', 'No specific contraindications.')}\n\n"
-                f"[AUDITOR SECOND OPINION]\n"
-                f"Verdict: {verdict}\n"
-                f"Audit Notes: {critique}\n\n"
-                f"Task: Write a two-paragraph 'Professional Executive Summary'.\n"
-                f"Paragraph 1: Summarize the nutritional strategy based on metabolic and microbiome needs.\n"
-                f"Paragraph 2: Directly address the auditor's {verdict} verdict and cautionary notes.\n"
-                f"Requirements: Professional medical tone. Markdown format. No conversational headers."
-            )
-
-            print(f"[DEBUG_AGENT_LLM_PROMPT: {self.name}] Generating professional narrative...")
-            clinical_summary = self._call_ollama(prompt)
-
-            # 3. CONSTRUCT FINAL PAYLOAD (PDF-Ready)
             report_payload = {
                 "metadata": {
+                    "report_title": "PN-DSS Meal Plan and Evaluation Report",
                     "patient_id": pid,
                     "report_date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "status": verdict,
-                    "age": patient.get('edad_v22', 'N/A'),
-                    "bmi": context.get('personal_evaluator', {}).get('data', {}).get('bmi', 'N/A'),
-                    "protein_target": planner_results.get('clinical_targets', {}).get('protein', 'N/A'),
-                    "kcal_target": planner_results.get('clinical_targets', {}).get('calories', 'N/A')
                 },
-                "clinical_summary": clinical_summary,
-                "judge_critique": critique,
-                "meal_plan_table": meal_plan,
-                "clinical_trace": context.get('agent_trace', []) 
+                
+                "meal_plan_table": plan_data.get('meal_plan', 'Plan generation failed.'),
+
+                # --- LAYER 1: TECHNICAL AUDIT ---
+                "layer_1_audit": {
+                    "agent_trace": [
+                        {
+                            "agent": "Personal", 
+                            "logic": self._sanitize_logic(memories.get('personal_evaluator_memory')),
+                            "duration": timers.get("Personal", "N/A") # FIXED: Added duration
+                        },
+                        {
+                            "agent": "Nutrients", 
+                            "logic": self._sanitize_logic(memories.get('nutrients_evaluator_memory')),
+                            "duration": timers.get("Nutrients", "N/A") # FIXED: Added duration
+                        },
+                        {
+                            "agent": "Microbiome", 
+                            "logic": self._sanitize_logic(memories.get('microbiome_modulation_memory')),
+                            "duration": timers.get("Microbiome", "N/A") # FIXED: Added duration
+                        },
+                        {
+                            "agent": "Constraints", 
+                            "logic": self._sanitize_logic(memories.get('constraint_manager_memory')),
+                            "duration": timers.get("Constraints", "N/A") # FIXED: Added duration
+                        },
+                        {
+                            "agent": "Planner", 
+                            "logic": self._sanitize_logic(memories.get('meal_planner_memory')),
+                            "duration": timers.get("Planner", "N/A") # FIXED: Added duration
+                        },
+                        {
+                            "agent": "Technical Audit", 
+                            "logic": "LM-Judge Safety and Technical Verification Complete.",
+                            "duration": timers.get("Technical Audit", "N/A") # FIXED: Added Judge time
+                        }
+                    ],
+                    "verdict": judge_data.get('verdict', 'Caution'),
+                    "structured_comparison": judge_data.get('structured_comparison', [])
+                },
+
+                # --- LAYER 2: QUANTITATIVE ANALYSIS ---
+                "layer_2_quantitative": {
+                    "total_score": f"{dqi_data.get('total_dqi_score', 'N/A')}/100",
+                    "variety_score": dqi_breakdown.get('variety', {}).get('total', 0),
+                    "adequacy_score": dqi_breakdown.get('adequacy', {}).get('total', 0),
+                    "moderation_score": dqi_breakdown.get('moderation', {}).get('total', 0),
+                    "balance_score": dqi_breakdown.get('balance', {}).get('total', 0)
+                }
             }
 
-            # NOTE: Persistence logic (_save_to_local_memory) removed to maintain statelessness.
-
-            return {
-                "status": "success",
-                "summary": f"Clinical document finalized with '{verdict}' verdict.",
-                "data": report_payload
-            }
+            return {"status": "success", "data": report_payload}
 
         except Exception as e:
-            print(f"[DEBUG_AGENT_ERROR: {self.name}] {str(e)}")
-            return {
-                "status": "error", 
-                "message": f"ReportAgent failed: {str(e)}", 
-                "data": {}
-            }
-
-    def _call_ollama(self, prompt: str) -> str:
-        try:
-            result = subprocess.run(
-                ["ollama", "run", self.model_name, prompt],
-                capture_output=True, text=True, check=True, encoding='utf-8'
-            )
-            raw = result.stdout.strip()
-            return re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        except:
-            return "Professional clinical summary currently unavailable."
+            return {"status": "error", "message": str(e)}
